@@ -185,7 +185,7 @@ Status legend: ✅ done+validated · 🔬 hole identified · ⬜ not started.
 | Go | Gin / chi / net-http | request → route → handler → service | X | ✅ **routes on ANY group var** (`v1.GET`, `PublicGroup.GET`) not just `r/router` (gin-vue-admin S→M 4→259 / realworld S / gitness L) — was missing all group-routed apps; named handlers resolve precisely. 🔬 inline `func(c){}` handlers (anonymous, body lost), gitness chi custom (26/321) |
 | Rust | Axum / actix / Rocket | request → route → handler | R + X | ✅ **Axum chained methods + namespaced handlers** — `.route("/x", get(h1).post(h2))` emitted only the first method+handler, and `get(mod::handler)` captured the module not the fn (realworld-axum S **12→19, 19/19**); balanced-paren scan + per-method nodes + last-`::`-segment handler. **Rocket attribute macros 550/556 (99%)** (Rocket repo L) — already strong. crates.io named axum routes resolve (6/8; rest are closures/var handlers; its API is mostly the utoipa `routes!` macro = frontier). Cargo-workspace module resolution (prior work). **actix builder API** `web::resource("/x").route(web::get().to(h))` / `.to(h)` / App `.route("/x", web::get().to(h))` (actix-examples **51→128 routes, 35→112 resolved**) — was the dominant actix style and fully missed (the handler is in `.to(h)`, not `get(h)`). 🔬 actix `web::scope("/api")` prefix (not prepended to nested resource paths) + anonymous `.to` closure handlers |
 | Java | Spring | request → @RestController → @Autowired service → repo | R + X | ✅ **bare `@GetMapping`/`@PostMapping` + class `@RequestMapping` prefix join → route→method** (realworld S / mall M / halo L) — was missing all path-less method mappings; DI controller→service resolves (name + dir). 🔬 Spring Data JPA derived queries (`findByEmail`) — metaprogramming frontier |
-| Kotlin | (coroutines / DI) | flow/callback dispatch | ? | ⬜ |
+| Kotlin | Spring Boot / Jetpack Compose | request → @RestController → service; @Composable → child | R + X | ✅ **Spring Boot Kotlin** — the Spring resolver was `['java']`-only with a Java-syntax method regex (`public X name()`); extended to `.kt` + Kotlin `fun name(` handler matching (petclinic-kotlin **0→18, 18/18**; class-prefix joins; DI controller→repo resolves — `showOwner ← GET /owners/{ownerId}` → `OwnerRepository.findById`). **Compose composition already static** (@Composable→child are plain function calls — Jetcaster `PodcastInformation→HtmlTextContainer`). Java Spring unchanged (realworld 19/19). 🔬 Ktor `routing { get("/x"){…} }` lambda handlers (anonymous) + Compose recomposition (implicit `mutableStateOf`, no setState gate) + coroutines/Flow |
 | Swift | Vapor | request → route → controller | R + X | ✅ **was 0 routes on every real app** — the extractor required an `app/router/routes` receiver + a `"path"` literal, but real Vapor routes on grouped builders (`let todos = routes.grouped("todos"); todos.get(use: index)`) with NO path arg. Rewrote: any receiver, optional/non-string path segments, `.grouped`/`.group{}` prefix tracking, `use:` discriminator. vapor-template S **0→3 (3/3**, nested `/todos/:todoID`), SteamPress M **0→27 (27/27)**, SwiftPackageIndex-Server L **0→14 (14/14** handler resolution). 🔬 typed-route enums (SPI `SiteURL.x.pathComponents` — path label only, handler still resolves) + closure handlers `app.get("x"){ }` (anonymous) |
 | C# | ASP.NET Core | request → [Http*] action → DI service → EF | X | ✅ **feature-folder detection** (realworld 0→19 — was undetected) + **bare `[HttpGet]` + class `[Route]` prefix** (eShopOnWeb 9→33 / jellyfin L) — co-located so no claimsReference needed. 🔬 EF Core LINQ/DbSet (metaprogramming frontier) |
 | Ruby | Rails / Sinatra | request → routes.rb → Controller#action → model | R | ✅ **RESTful `resources`/`resource` routing → controller#action** (realworld S 16 / spree M / forem L), pluralization + only/except + claimsReference; explicit routes fixed to precise `controller#action` too. 🔬 ActiveRecord dynamic finders (`Article.find_by_slug`) — metaprogramming frontier |
@@ -445,6 +445,23 @@ Status legend: ✅ done+validated · 🔬 hole identified · ⬜ not started.
   (frontier):** MVVM state management (compass_app uses Command/ChangeNotifier + ListenableBuilder, 0 setState —
   a different dispatch shape) and `Navigator.push(MaterialPageRoute(builder: (_) => DetailPage()))` navigation
   (route-as-widget, uncovered).
+- **Kotlin / Spring Boot + Jetpack Compose (validated 2026-05-23, spring-petclinic-kotlin S / compose-samples) — extend Spring to Kotlin; Compose is free.**
+  Kotlin had ZERO framework coverage — no resolver listed `kotlin`, and the Spring resolver was `languages:
+  ['java']` with a `.java`-only extract gate and a Java-syntax handler regex (`public X name()`). So Spring Boot
+  Kotlin apps (identical `@GetMapping`/`@RestController` annotations, `.kt` files) extracted 0 routes. Extended
+  the Spring resolver: `['java','kotlin']`, accept `.kt`, and add a Kotlin `fun name(` alternative to the
+  handler-method regex (Kotlin has no access modifier and the return type follows the name). petclinic-kotlin
+  **0→18, 18/18**; class `@RequestMapping` prefixes join, stacked annotations (`@ResponseBody`) are skipped, DI
+  controller→repo resolves (`showOwner ← GET /owners/{ownerId}` → `OwnerRepository.findById` /
+  `VisitRepository.findByPetId`). Java Spring unchanged (realworld 19/19 — the Kotlin `fun` and Java `public X`
+  alternatives are disjoint per language). **Jetpack Compose composition needs no work** — `@Composable`
+  functions calling child `@Composable`s are plain Kotlin function calls, already static (Jetcaster
+  `PodcastInformation→HtmlTextContainer`, `FollowedPodcastCarouselItem→PodcastImage`), like Dart widget
+  constructors. Agent A/B (view-owner flow, n=2/arm): codegraph **0–1 read / 0 grep / 1 codegraph / 11–18s** (a
+  single `context` call answers it) vs without **2 read / 0–1 grep + glob / 20–28s**. **Residuals (frontier):**
+  Ktor `routing { get("/x") { … } }` inline-lambda handlers (anonymous,
+  no named target), Compose recomposition (implicit — reading `mutableStateOf` triggers recompose, no
+  `setState`-style gate to anchor a synthesizer), and coroutines/Flow dispatch.
 - **Difficulty gradient is real:** named-ref dispatch (resolver) is cheap; anonymous
   callback dispatch (synthesizer) is medium; **anonymous-arrow handlers are the hard
   remaining gap** (no identity → need synthesizer link-through-body, not yet built).
