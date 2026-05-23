@@ -183,7 +183,7 @@ Status legend: ✅ done+validated · 🔬 hole identified · ⬜ not started.
 | Python | Django / DRF (views) | url → view → model | R + X | ✅ url→view (`path`/`url`/`as_view`) + **DRF `router.register`→ViewSet** (realworld S / wagtail M / saleor L); ORM QuerySet→SQL (prior work). 🔬 signals (`post_save`→receiver), DRF viewset CRUD actions (inherited), saleor GraphQL resolvers |
 | Python | Flask / FastAPI | request → route → handler → dependency | R + X | ✅ **Flask: handler resolved across intervening decorators (`@login_required`) + stacked `@x.route` lines** (microblog S 6→27, redash L decorator routes 6/6); **FastAPI: empty-path router-root routes `@router.get("")` incl. multi-line** (realworld S 12→20 / Netflix dispatch L **290/290 100%**) + **bare-name builtin guard** — a handler named after a Python builtin method (`index`/`get`/`update`/`count`…) was filtered as a builtin and lost its route→handler edge. 🔬 Flask-RESTful class-based `add_resource(Resource, '/x')` (redash — separate mechanism, not the README decorator/blueprint shape); FastAPI `Depends()` dependency edges (resolver exists, light validation) |
 | Go | Gin / chi / net-http | request → route → handler → service | X | ✅ **routes on ANY group var** (`v1.GET`, `PublicGroup.GET`) not just `r/router` (gin-vue-admin S→M 4→259 / realworld S / gitness L) — was missing all group-routed apps; named handlers resolve precisely. 🔬 inline `func(c){}` handlers (anonymous, body lost), gitness chi custom (26/321) |
-| Rust | Axum / Cargo workspace | request → handler; trait dispatch | R | 🔬 (workspaces done) |
+| Rust | Axum / actix / Rocket | request → route → handler | R + X | ✅ **Axum chained methods + namespaced handlers** — `.route("/x", get(h1).post(h2))` emitted only the first method+handler, and `get(mod::handler)` captured the module not the fn (realworld-axum S **12→19, 19/19**); balanced-paren scan + per-method nodes + last-`::`-segment handler. **Rocket attribute macros 550/556 (99%)** (Rocket repo L) — already strong. crates.io named axum routes resolve (6/8; rest are closures/var handlers; its API is mostly the utoipa `routes!` macro = frontier). Cargo-workspace module resolution (prior work). 🔬 **actix runtime routing** `web::get().to(handler)` / `web::resource().route()` (67 calls in actix-examples — the dominant actix style, unextracted; attribute macros 35/51) |
 | Java | Spring | request → @RestController → @Autowired service → repo | R + X | ✅ **bare `@GetMapping`/`@PostMapping` + class `@RequestMapping` prefix join → route→method** (realworld S / mall M / halo L) — was missing all path-less method mappings; DI controller→service resolves (name + dir). 🔬 Spring Data JPA derived queries (`findByEmail`) — metaprogramming frontier |
 | Kotlin | (coroutines / DI) | flow/callback dispatch | ? | ⬜ |
 | Swift | Vapor | request → route → controller | ? | ⬜ |
@@ -370,6 +370,24 @@ Status legend: ✅ done+validated · 🔬 hole identified · ⬜ not started.
   418 attribute files vs 3 procedural `*.module` hooks), so the resolver's procedural-hook detection (docblock
   `@Implements` / `module_hook` naming) finds essentially nothing in modern core (0 hook edges). Both are real
   follow-ups, not regressions.
+- **Rust / Axum + Rocket + actix (validated 2026-05-23, realworld-axum S / actix-examples + Rocket M / crates.io L) — Axum chained-method + namespaced-handler fix.**
+  The attribute-macro path (`#[get("/x")] fn h`, actix/Rocket) and single Axum `.route("/x", get(h))` already
+  worked, but the Axum extractor used a flat regex that captured only the FIRST `method(handler)` of a route
+  and only a bare `\w+` handler. Two dominant Axum idioms broke it: (1) **method chains**
+  `.route("/user", get(get_current_user).put(update_user))` — the `.put` arm produced NO route node, so half
+  the API was missing (realworld-axum had only the GET of each chain); (2) **namespaced handlers**
+  `get(listing::feed_articles)` — `\w+` captured `listing` (the module), so the route resolved to nothing.
+  Rewrote with a balanced-paren scan of each `.route(...)` call, a per-method node, and last-`::`-segment
+  handler names → realworld-axum **12→19 routes, 19/19 resolved** (every chained PUT/DELETE/POST now present;
+  `feed_articles` resolves). **Rocket needed nothing** (550/556, 99% — attribute macros). crates.io confirms
+  namespaced axum handlers resolve (router.rs 6/6) but defines most of its API via the `utoipa_axum` `routes!`
+  macro (frontier) and has a SvelteKit frontend (42 of its 50 "routes" are `+page.svelte`, correctly
+  attributed to SvelteKit). **Residual (frontier): actix runtime routing** — `web::get().to(handler)` /
+  `web::resource("/x").route(...)` is the dominant actix style (actix-examples: 67 runtime calls vs 51
+  attribute) and is unextracted; only the attribute macros are covered (35/51). Agent A/B (update-user flow,
+  n=2/arm): codegraph **0–2 read / 0 grep / 32–40s** vs without **3 read / 0–1 grep + glob / 33–41s** — modest
+  (realworld-axum is in the small-repo tie zone) but consistent, with one fully-clean 0-read/0-grep run. Node
+  count stable; the fix is Axum-scoped (the attribute/actix/Rocket path is untouched).
 - **Difficulty gradient is real:** named-ref dispatch (resolver) is cheap; anonymous
   callback dispatch (synthesizer) is medium; **anonymous-arrow handlers are the hard
   remaining gap** (no identity → need synthesizer link-through-body, not yet built).
