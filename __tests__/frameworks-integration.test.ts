@@ -153,3 +153,47 @@ describe('Flutter end-to-end — setState→build synthesis', () => {
     cg.close();
   });
 });
+
+describe('C++ end-to-end — virtual override synthesis', () => {
+  let tmpDir: string | undefined;
+  afterEach(() => {
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+    tmpDir = undefined;
+  });
+
+  it('bridges a base virtual method to the subclass override', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-cpp-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'iter.cpp'),
+      'class Iterator {\n' +
+        ' public:\n' +
+        '  virtual void Next() { }\n' +
+        '};\n' +
+        'class DBIter : public Iterator {\n' +
+        ' public:\n' +
+        '  void Next() override { advance(); }\n' +
+        '  void advance() { }\n' +
+        '};\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    // Two methods named Next: the base virtual (lower line) and the override.
+    const nexts = cg
+      .getNodesByKind('method')
+      .filter((n) => n.name === 'Next')
+      .sort((a, b) => a.startLine - b.startLine);
+    expect(nexts.length).toBe(2);
+    const [baseNext, overrideNext] = nexts;
+
+    // A vtable call to Iterator::Next dispatches to DBIter::Next — bridge it so
+    // trace/callees from the interface method reaches the implementation.
+    const edge = cg
+      .getOutgoingEdges(baseNext!.id)
+      .find((e) => e.target === overrideNext!.id && e.kind === 'calls');
+    expect(edge, 'Iterator::Next should reach DBIter::Next via override synthesis').toBeDefined();
+
+    cg.close();
+  });
+});

@@ -279,6 +279,54 @@ function flutterBuildEdges(queries: QueryBuilder, ctx: ResolutionContext): Edge[
 }
 
 /**
+ * Phase 4c: C++ virtual override. A call through a base/interface pointer
+ * (`db->Get(...)`, `iter->Next()`) dispatches at runtime to a subclass override,
+ * but that hop is a vtable indirection — no static call edge — so a flow stops at
+ * the abstract base method. Bridge it like react-render: for each C++ class that
+ * `extends` a base, link each base method → the subclass method of the same name
+ * (the override), so trace/callees from the interface method reach the
+ * implementation(s). Over-approximation accepted (reachability-correct); capped
+ * per class and gated to C++ to avoid touching other languages' dispatch.
+ */
+function cppOverrideEdges(queries: QueryBuilder): Edge[] {
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+  const methodsOf = (classId: string): Node[] =>
+    queries
+      .getOutgoingEdges(classId, ['contains'])
+      .map((e) => queries.getNodeById(e.target))
+      .filter((n): n is Node => !!n && n.kind === 'method');
+  for (const cls of queries.getNodesByKind('class')) {
+    const subMethods = methodsOf(cls.id).filter((n) => n.language === 'cpp');
+    if (subMethods.length === 0) continue;
+    for (const ext of queries.getOutgoingEdges(cls.id, ['extends'])) {
+      const base = queries.getNodeById(ext.target);
+      if (!base || base.language !== 'cpp' || base.id === cls.id) continue;
+      const baseMethods = new Map(methodsOf(base.id).map((m) => [m.name, m]));
+      let added = 0;
+      for (const m of subMethods) {
+        if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
+        const bm = baseMethods.get(m.name);
+        if (!bm || bm.id === m.id) continue;
+        const key = `${bm.id}>${m.id}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        edges.push({
+          source: bm.id,
+          target: m.id,
+          kind: 'calls',
+          line: bm.startLine,
+          provenance: 'heuristic',
+          metadata: { synthesizedBy: 'cpp-override', via: m.name, registeredAt: `${m.filePath}:${m.startLine}` },
+        });
+        added++;
+      }
+    }
+  }
+  return edges;
+}
+
+/**
  * Phase 5: React JSX child rendering. A component that returns `<Child .../>`
  * mounts Child — React calls it — but JSX instantiation isn't a static call edge,
  * so a render tree (App.render → StaticCanvas → renderStaticScene) breaks at the
@@ -424,10 +472,11 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
   const jsxEdges = reactJsxChildEdges(ctx);
   const vueEdges = vueTemplateEdges(ctx);
   const flutterEdges = flutterBuildEdges(queries, ctx);
+  const cppEdges = cppOverrideEdges(queries);
 
   const merged: Edge[] = [];
   const seen = new Set<string>();
-  for (const e of [...fieldEdges, ...emitterEdges, ...renderEdges, ...jsxEdges, ...vueEdges, ...flutterEdges]) {
+  for (const e of [...fieldEdges, ...emitterEdges, ...renderEdges, ...jsxEdges, ...vueEdges, ...flutterEdges, ...cppEdges]) {
     const key = `${e.source}>${e.target}`;
     if (seen.has(key)) continue;
     seen.add(key);

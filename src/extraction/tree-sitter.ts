@@ -1799,6 +1799,27 @@ export class TreeSitterExtractor {
         }
       }
 
+      // C++ base classes: `class Derived : public Base, private Other` →
+      // base_class_clause holds access specifiers + base type(s). Emit an extends
+      // ref per base type (skip the public/private/protected keywords).
+      if (child.type === 'base_class_clause') {
+        for (const t of child.namedChildren) {
+          if (
+            t.type === 'type_identifier' ||
+            t.type === 'qualified_identifier' ||
+            t.type === 'template_type'
+          ) {
+            this.unresolvedReferences.push({
+              fromNodeId: classId,
+              referenceName: getNodeText(t, this.source),
+              referenceKind: 'extends',
+              line: t.startPosition.row + 1,
+              column: t.startPosition.column,
+            });
+          }
+        }
+      }
+
       if (
         child.type === 'implements_clause' ||
         child.type === 'class_interface_clause' ||
