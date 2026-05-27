@@ -20,6 +20,32 @@ import {
 import { safeJsonParse } from '../utils';
 import { kindBonus, nameMatchBonus, scorePathRelevance } from '../search/query-utils';
 import { parseQuery, boundedEditDistance } from '../search/query-parser';
+import { isGeneratedFile } from '../extraction/generated-detection';
+
+/**
+ * Path-only heuristic for files that should not be candidates for
+ * "dominant file" detection: test/spec files and tool-generated files.
+ * Generated files (`*.pb.go`, `*.pulsar.go`, mock outputs, …) often
+ * have huge in-file edge counts that dwarf the real source — etcd's
+ * `rpc.pb.go` has 4× the in-file edges of `server.go`.
+ */
+function isLowValueFile(filePath: string): boolean {
+  const lp = filePath.toLowerCase();
+  return (
+    /(?:^|\/)(tests?|__tests?__|spec)\//.test(lp) ||
+    /_test\.go$/.test(lp) ||
+    /(?:^|\/)test_[^/]+\.py$/.test(lp) ||
+    /_test\.py$/.test(lp) ||
+    /_spec\.rb$/.test(lp) ||
+    /_test\.rb$/.test(lp) ||
+    /\.(test|spec)\.[jt]sx?$/.test(lp) ||
+    /(test|spec|tests)\.(java|kt|scala)$/.test(lp) ||
+    /(tests?|spec)\.cs$/.test(lp) ||
+    /tests?\.swift$/.test(lp) ||
+    /_test\.dart$/.test(lp) ||
+    isGeneratedFile(filePath)
+  );
+}
 
 const SQLITE_PARAM_CHUNK_SIZE = 500;
 
@@ -182,6 +208,7 @@ export class QueryBuilder {
     getUnresolvedBatch?: SqliteStatement;
     getAllFilePaths?: SqliteStatement;
     getAllNodeNames?: SqliteStatement;
+    getDominantFile?: SqliteStatement;
   } = {};
 
   constructor(db: SqliteDatabase) {
@@ -487,6 +514,54 @@ export class QueryBuilder {
     }
     const rows = this.stmts.getNodesByFile.all(filePath) as NodeRow[];
     return rows.map(rowToNode);
+  }
+
+  /**
+   * Find the file that holds the densest concentration of the project's
+   * internal call graph — the "core" file. Used by context-builder to
+   * boost ranking of symbols in that file's directory (so e.g. sinatra
+   * queries surface `lib/sinatra/base.rb`'s `route!` instead of
+   * `sinatra-contrib/lib/sinatra/multi_route.rb`'s `route` extension).
+   *
+   * Returns null if no file has a meaningful concentration (e.g. spread
+   * evenly across many files, or empty index).
+   *
+   * "Internal" = source and target are in the same file. Cross-file
+   * edges aren't useful here — they don't tell us which file is the
+   * functional center.
+   *
+   * Excludes test/spec files from candidacy via path-pattern. The agent's
+   * typical question is "how does X work", not "how is X tested", so
+   * boosting a test file's directory would be a misfire.
+   */
+  getDominantFile(): { filePath: string; edgeCount: number; nextEdgeCount: number } | null {
+    if (!this.stmts.getDominantFile) {
+      // Pull top 20 candidates; we then filter out test/generated files
+      // in code (regex-grade matching that SQL LIKE can't express). The
+      // generated-file filter is critical — without it, etcd's
+      // `api/etcdserverpb/rpc.pb.go` (1916 in-file edges, generated
+      // protobuf stub) outranks the real `server/etcdserver/server.go`
+      // (470 edges) by 4×, and the boost would push the agent toward
+      // generated code.
+      this.stmts.getDominantFile = this.db.prepare(`
+        SELECT n.file_path AS file_path, COUNT(*) AS edge_count
+        FROM edges e
+        JOIN nodes n ON e.source = n.id
+        JOIN nodes m ON e.target = m.id
+        WHERE n.file_path = m.file_path
+        GROUP BY n.file_path
+        ORDER BY edge_count DESC
+        LIMIT 20
+      `);
+    }
+    const rows = this.stmts.getDominantFile.all() as Array<{ file_path: string; edge_count: number }>;
+    const filtered = rows.filter(r => !isLowValueFile(r.file_path));
+    if (filtered.length === 0 || filtered[0]!.edge_count < 20) return null;
+    return {
+      filePath: filtered[0]!.file_path,
+      edgeCount: filtered[0]!.edge_count,
+      nextEdgeCount: filtered[1]?.edge_count ?? 0,
+    };
   }
 
   /**
