@@ -124,41 +124,52 @@ export interface ExploreOutputBudget {
   includeCompletenessSignal: boolean;
   /** Include the explore-budget reminder at the end. */
   includeBudgetNote: boolean;
+  /**
+   * Hard-drop test/spec/icon/i18n files from the relevant-file set unless
+   * the query itself mentions tests. Today they're only deprioritized in
+   * the sort, which on tiny repos still lets one slip into the top N (e.g.
+   * cobra's `command_test.go` displaced `args.go` and contributed ~10KB of
+   * pure noise to "How does cobra parse commands?"). Off by default; on
+   * for the very-tiny tier where one slip dominates the budget.
+   */
+  excludeLowValueFiles: boolean;
 }
 
 export function getExploreOutputBudget(fileCount: number): ExploreOutputBudget {
   if (fileCount < 150) {
     return {
-      // Very-tiny tier paired with the tool gating in ToolHandler.getTools
-      // (<150 files exposes only 5 core tools). Together: ~50% prompt
-      // overhead reduction + tighter explore output. Per-file kept at
-      // 3800 (the next tier's value) to satisfy the monotonic invariant.
-      // Relationships kept ON — cheap structural signal that survives
-      // even after the budget cut.
+      // ITER3: revert iter2's aggressive body shrink (forced Read fallback —
+      // the per-file 2.5K cap pushed the agent to Read instead of node).
+      // Back to the iter1 shape (13K/4/3.8K) but keep the test-file
+      // hard-exclude. The cost lever for this tier lives in handleContext
+      // (steering the agent to stop after 1-2 calls), not in this budget.
       maxOutputChars: 13000,
       defaultMaxFiles: 4,
       maxCharsPerFile: 3800,
       gapThreshold: 7,
       maxSymbolsInFileHeader: 5,
       maxEdgesPerRelationshipKind: 4,
-      includeRelationships: true,
+      includeRelationships: false,
       includeAdditionalFiles: false,
       includeCompletenessSignal: false,
       includeBudgetNote: false,
+      excludeLowValueFiles: true,
     };
   }
   if (fileCount < 500) {
     return {
+      // ITER3: same revert/keep-filter pattern as <150.
       maxOutputChars: 18000,
       defaultMaxFiles: 5,
       maxCharsPerFile: 3800,
       gapThreshold: 8,
       maxSymbolsInFileHeader: 6,
       maxEdgesPerRelationshipKind: 6,
-      includeRelationships: true,
+      includeRelationships: false,
       includeAdditionalFiles: false,
       includeCompletenessSignal: false,
       includeBudgetNote: false,
+      excludeLowValueFiles: true,
     };
   }
   if (fileCount < 5000) {
@@ -178,6 +189,7 @@ export function getExploreOutputBudget(fileCount: number): ExploreOutputBudget {
       includeAdditionalFiles: true,
       includeCompletenessSignal: true,
       includeBudgetNote: true,
+      excludeLowValueFiles: false,
     };
   }
   if (fileCount < 15000) {
@@ -192,6 +204,7 @@ export function getExploreOutputBudget(fileCount: number): ExploreOutputBudget {
       includeAdditionalFiles: true,
       includeCompletenessSignal: true,
       includeBudgetNote: true,
+      excludeLowValueFiles: false,
     };
   }
   return {
@@ -205,6 +218,7 @@ export function getExploreOutputBudget(fileCount: number): ExploreOutputBudget {
     includeAdditionalFiles: true,
     includeCompletenessSignal: true,
     includeBudgetNote: true,
+    excludeLowValueFiles: false,
   };
 }
 
@@ -688,7 +702,13 @@ export class ToolHandler {
       // 5 is the empirical lower bound. Tools beyond search/context/
       // node/explore/trace pay overhead that the agent doesn't recoup
       // on tiny-repo flow questions.
-      const TINY_REPO_FILE_THRESHOLD = 150;
+      // ITER4: raise threshold 150 → 500 so single-file frameworks
+      // (sinatra at 159, slim_framework around 200) also get the
+      // 5-tool surface. The empirical 5-tool floor was set on <150
+      // probes; iter3 measurement showed sinatra is structurally the
+      // SAME problem as cobra (single-file WITHOUT-arm Read wins),
+      // so it deserves the same gating.
+      const TINY_REPO_FILE_THRESHOLD = 500;
       const TINY_REPO_CORE_TOOLS = new Set([
         'codegraph_search',
         'codegraph_context',
@@ -1095,9 +1115,12 @@ export class ToolHandler {
     // 8 covers the typical 1-3 entry-point + their immediate neighbors
     // without dragging in the rest of the small codebase.
     let defaultMaxNodes = 20;
+    let isTinyRepo = false;
+    let isSmallRepo = false;
     try {
       const stats = cg.getStats();
-      if (stats.fileCount < 150) defaultMaxNodes = 8;
+      if (stats.fileCount < 150) { defaultMaxNodes = 8; isTinyRepo = true; }
+      else if (stats.fileCount < 500) { isSmallRepo = true; }
     } catch {
       // stats failure — fall back to the standard default
     }
@@ -1123,13 +1146,39 @@ export class ToolHandler {
     // multi-module flow questions (Q3 / etcd Q2 in the audit).
     const flowTrace = await this.maybeInlineFlowTrace(task, cg);
 
+    // Iter3 — sufficiency steering on small repos.
+    //
+    // Measured economics on tiny (<150) and small (<500) projects: every
+    // additional MCP tool call costs ~$0.02-0.05 in cache-write tokens
+    // (5K-15K per response at $3.75/1M). The agent reflexively follows
+    // codegraph_context with explore/node even when the context response
+    // is already sufficient — that pattern drove the cost gap that
+    // smaller bodies (iter2) failed to close (smaller bodies just shifted
+    // the agent to Read instead). Direct directive on small-repo
+    // responses: tell the agent the context call IS the comprehensive
+    // pass for a project of this size and that follow-ups should be
+    // narrow (trace from→to, node single-symbol) — not another broad
+    // explore that re-bundles the same content.
+    // ITER4: unified strong directive for both tiny (<150) and small
+    // (<500) tiers — measured iter3 result was that the soft <500
+    // wording was IGNORED on sinatra (5 tool calls, +92% loss) while
+    // the strong <150 wording was followed on cobra/slim (3 calls,
+    // -21%/-22% wins). The single-file-framework problem (sinatra)
+    // is structurally the same as cobra's; both deserve the same
+    // sufficiency steering.
+    let smallRepoTail = '';
+    if (isTinyRepo || isSmallRepo) {
+      const sizeQualifier = isTinyRepo ? 'under 150' : 'under 500';
+      smallRepoTail = `\n\n---\n> **This project is small** (${sizeQualifier} indexed files). The entry points and code above cover the relevant surface — **do NOT call codegraph_explore as a follow-up; its content will largely duplicate this response**. If you need a specific flow, call \`codegraph_trace from→to\`. If you need one specific symbol's body, call \`codegraph_node <name>\`. Otherwise, answer from what is above.`;
+    }
+
     // buildContext returns string when format is 'markdown'
     if (typeof context === 'string') {
-      return this.textResult(this.truncateOutput(context + flowTrace + reminder));
+      return this.textResult(this.truncateOutput(context + flowTrace + reminder + smallRepoTail));
     }
 
     // If it returns TaskContext, format it
-    return this.textResult(this.truncateOutput(this.formatTaskContext(context) + flowTrace + reminder));
+    return this.textResult(this.truncateOutput(this.formatTaskContext(context) + flowTrace + reminder + smallRepoTail));
   }
 
   /**
@@ -1176,6 +1225,7 @@ export class ToolHandler {
       seen.add(key);
       ids.push(sym);
     }
+
     if (ids.length < 2) return '';
 
     // The first two distinct symbols, in order of appearance, are the most
@@ -1950,10 +2000,51 @@ export class ToolHandler {
     }
 
     // Only include files that have entry points or nodes directly connected to entry points
-    const relevantFiles = [...fileGroups.entries()].filter(([, group]) => group.score >= 3);
+    let relevantFiles = [...fileGroups.entries()].filter(([, group]) => group.score >= 3);
 
     // Extract query terms for relevance checking
     const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length >= 3);
+
+    // Test/spec/icon/i18n file detector — used both for the pre-sort hard
+    // filter (tiny tier) and the comparator deprioritization (all tiers).
+    const isLowValue = (p: string) => {
+      const lp = p.toLowerCase();
+      return (
+        /\/(tests?|__tests?__|spec)\//.test(lp) ||
+        /_test\.go$/.test(lp) ||
+        /(?:^|\/)test_[^/]+\.py$/.test(lp) ||
+        /_test\.py$/.test(lp) ||
+        /_spec\.rb$/.test(lp) ||
+        /_test\.rb$/.test(lp) ||
+        /\.(test|spec)\.[jt]sx?$/.test(lp) ||
+        /(test|spec|tests)\.(java|kt|scala)$/.test(lp) ||
+        /(tests?|spec)\.cs$/.test(lp) ||
+        /tests?\.swift$/.test(lp) ||
+        /_test\.dart$/.test(lp) ||
+        /\bicons?\b/.test(lp) ||
+        /\bi18n\b/.test(lp)
+      );
+    };
+
+    // Tiny-tier hard-exclude: on small projects (`excludeLowValueFiles`
+    // budget flag), one slipped test/spec file dominates the per-file budget
+    // (cobra's `command_test.go` displaced `args.go` and contributed ~10KB of
+    // pure noise to "How does cobra parse commands?"). The sort-step
+    // deprioritization isn't enough at small N. Skip the hard-exclude when
+    // the query itself is about tests — that's the legitimate "explore the
+    // tests" case where the agent does want them.
+    if (budget.excludeLowValueFiles) {
+      const queryMentionsTests = /\b(test|tests|testing|spec|verify|verifies)\b/i.test(query);
+      if (!queryMentionsTests) {
+        const nonLow = relevantFiles.filter(([p]) => !isLowValue(p));
+        // Only apply the hard-filter if we still have at least 2 non-test
+        // candidates after the cut — otherwise the agent is asking about an
+        // area where tests are the only signal, and we should not strip them.
+        if (nonLow.length >= 2) {
+          relevantFiles = nonLow;
+        }
+      }
+    }
 
     // Sort files: highest relevance first, deprioritize low-value files
     const sortedFiles = relevantFiles.sort((a, b) => {
@@ -1971,36 +2062,6 @@ export class ToolHandler {
       const bRelevant = hasQueryRelevance(bPath, b[1].nodes);
       if (aRelevant !== bRelevant) return aRelevant ? -1 : 1;
 
-      // Deprioritize test files, icon files, and i18n files. Covers both
-      // directory-style (`/tests/`, `/spec/`) AND suffix-style conventions
-      // across every language we support — without the suffix check, etcd's
-      // `watchable_store_test.go` displaced 5K chars of real-flow source in
-      // codegraph_explore for Q2.
-      const isLowValue = (p: string) =>
-        /\/(tests?|__tests?__|spec)\//i.test(p) ||
-        // Go: `*_test.go`
-        /_test\.go$/i.test(p) ||
-        // Python: `test_*.py` (pytest discovery) and `*_test.py`
-        /(?:^|\/)test_[^/]+\.py$/i.test(p) ||
-        /_test\.py$/i.test(p) ||
-        // Ruby: `*_spec.rb` (rspec) and `*_test.rb` (minitest)
-        /_spec\.rb$/i.test(p) ||
-        /_test\.rb$/i.test(p) ||
-        // JS / TS: `*.test.ts`, `*.spec.tsx`, etc.
-        /\.(test|spec)\.[jt]sx?$/i.test(p) ||
-        // JVM: `*Test.java`, `*Tests.java`, `*Spec.kt`, `*Spec.scala`
-        /(Test|Spec|Tests)\.(java|kt|scala)$/.test(p) ||
-        // C#: `*Tests.cs`, `*Test.cs`, `*Spec.cs`
-        /(Tests?|Spec)\.cs$/.test(p) ||
-        // Swift: `*Tests.swift` (XCTest convention)
-        /Tests?\.swift$/.test(p) ||
-        // Dart: `*_test.dart`
-        /_test\.dart$/i.test(p) ||
-        // Rust: `tests/*.rs` already caught by `/tests/` above; `_test.rs`
-        // and `_tests.rs` aren't Rust conventions (Rust uses `#[cfg(test)]`
-        // inside source files), so nothing extra needed.
-        /\bicons?\b/i.test(p) ||
-        /\bi18n\b/i.test(p);
       const aLow = isLowValue(aPath);
       const bLow = isLowValue(bPath);
       if (aLow !== bLow) return aLow ? 1 : -1;

@@ -74,8 +74,12 @@ describe('getExploreOutputBudget', () => {
     expect(medium.includeBudgetNote).toBe(true);
   });
 
-  it('keeps the Relationships section on for every tier — it is the cheapest structural signal', () => {
-    expect(getExploreOutputBudget(50).includeRelationships).toBe(true);
+  it('keeps the Relationships section on for medium+ tiers — small tiers drop it to maximize body density', () => {
+    // ITER2: relationships dropped on <500 tiers; on tiny repos the
+    // per-call payload is the cost driver, so even "cheap" structural
+    // signal adds up across follow-up turns. Re-enabled at ≥500 where
+    // body budgets are roomy enough to absorb the 1-2KB overhead.
+    expect(getExploreOutputBudget(50).includeRelationships).toBe(false);
     expect(getExploreOutputBudget(1000).includeRelationships).toBe(true);
     expect(getExploreOutputBudget(10000).includeRelationships).toBe(true);
     expect(getExploreOutputBudget(30000).includeRelationships).toBe(true);
