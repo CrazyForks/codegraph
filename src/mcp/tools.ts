@@ -631,6 +631,19 @@ export const tools: ToolDefinition[] = [
 ];
 
 /**
+ * Allowlist-filtered tool definitions WITHOUT an engine — the static surface the
+ * proxy answers `tools/list` with before any project is open. Mirrors
+ * `ToolHandler.getTools()` in the no-CodeGraph case (the dynamic per-repo budget
+ * note in a description only adds once `cg` is loaded; the schemas are static).
+ */
+export function getStaticTools(): ToolDefinition[] {
+  const raw = process.env.CODEGRAPH_MCP_TOOLS;
+  if (!raw || !raw.trim()) return tools;
+  const allow = new Set(raw.split(',').map(s => s.trim().replace(/^codegraph_/, '')).filter(Boolean));
+  return allow.size ? tools.filter(t => allow.has(t.name.replace(/^codegraph_/, ''))) : tools;
+}
+
+/**
  * Tool handler that executes tools against a CodeGraph instance
  *
  * Supports cross-project queries via the projectPath parameter.
