@@ -139,12 +139,16 @@ export interface ExploreOutputBudget {
 
 export function getExploreOutputBudget(fileCount: number): ExploreOutputBudget {
   // Tiered budget, scaled to project size. The budget is a CEILING (relevance
-  // still gates WHAT is included), but it MUST stay within the agent's per-tool
-  // output cap: a flat 100K experiment overflowed that cap on a broad explore
-  // (~67K chars) and forced the agent to Read instead — a bigger response is
-  // worse, not better. Tiers below were validated across the README's 7 repos
-  // (PR #569's per-symbol sizing rides on them). Invariant: a larger tier must
-  // never get a smaller `maxCharsPerFile` than a smaller tier.
+  // still gates WHAT is included), and it MUST stay under the agent's INLINE
+  // tool-result cap (~25K chars). Above that, the host externalizes the result
+  // to a file the agent then Reads back — re-introducing a read AND the
+  // cache-write cost — which is exactly what a 35K vscode explore did in the
+  // n=4 README A/B. So even large repos cap at ~24K: the answer is the handful
+  // of ~100-line flow windows the agent would have grep-located and read (it
+  // natively reads ~6–9 files, median 100-line ranges), NOT a sprawl of 12
+  // files. Concentration onto the flow emerges from this cap + the named-file-
+  // first sort dropping peripheral files. Invariant: a larger tier must never
+  // get a smaller `maxCharsPerFile` than a smaller tier.
   if (fileCount < 150) {
     return {
       // ITER3: revert iter2's aggressive body shrink (forced Read fallback —
@@ -183,13 +187,11 @@ export function getExploreOutputBudget(fileCount: number): ExploreOutputBudget {
   }
   if (fileCount < 5000) {
     return {
-      // Sized so ONE explore can cover a flow that centers on a god-file (e.g.
-      // excalidraw's 415 KB App.tsx): the previous 2500/file returned <1% of such
-      // a file, forcing the agent to Read it anyway. Per-file must also stay ≥ the
-      // smaller <500 tier (3800) — the old 2500 was non-monotonic. Tokens are
-      // cheap relative to a 5–10 Read round-trip spiral; favor sufficiency.
-      maxOutputChars: 28000,
-      defaultMaxFiles: 10,
+      // ~150-line per-file window (the native read unit) × ~6 files, capped at
+      // the ~24K inline ceiling so the response is never externalized. Per-file
+      // stays ≥ the <500 tier (3800) — monotonic.
+      maxOutputChars: 24000,
+      defaultMaxFiles: 8,
       maxCharsPerFile: 6500,
       gapThreshold: 12,
       maxSymbolsInFileHeader: 10,
@@ -201,10 +203,14 @@ export function getExploreOutputBudget(fileCount: number): ExploreOutputBudget {
       excludeLowValueFiles: false,
     };
   }
+  // Large + very-large repos: SAME ~24K inline ceiling (a bigger response just
+  // externalizes — see vscode). More files indexed → more CALLS via
+  // getExploreBudget, not a bigger single response. Per-file 7000 (≥ smaller
+  // tiers) gives the central file a ~180-line orientation window.
   if (fileCount < 15000) {
     return {
-      maxOutputChars: 35000,
-      defaultMaxFiles: 12,
+      maxOutputChars: 24000,
+      defaultMaxFiles: 8,
       maxCharsPerFile: 7000,
       gapThreshold: 15,
       maxSymbolsInFileHeader: 15,
@@ -217,8 +223,8 @@ export function getExploreOutputBudget(fileCount: number): ExploreOutputBudget {
     };
   }
   return {
-    maxOutputChars: 38000,
-    defaultMaxFiles: 14,
+    maxOutputChars: 24000,
+    defaultMaxFiles: 8,
     maxCharsPerFile: 7000,
     gapThreshold: 15,
     maxSymbolsInFileHeader: 15,
@@ -1650,7 +1656,14 @@ export class ToolHandler {
           return n.filePath.toLowerCase().includes(lc) || n.qualifiedName.toLowerCase().includes(lc);
         });
       for (const t of tokens) {
-        const cands = this.findAllSymbols(cg, t).nodes
+        // Enumerate ALL defs of a bare token via the direct index, not FTS — a
+        // 50+-overload name (tokio `poll`) ranks the wanted def (`Harness::poll`)
+        // below the FTS cut, so findAllSymbols would never see it and the
+        // type-token bias below couldn't pick the harness.rs one. (Same fix as
+        // codegraph_node's findSymbolMatches.) Qualified tokens keep findAllSymbols.
+        const isQual = /[.\/]|::/.test(t);
+        const raw = isQual ? this.findAllSymbols(cg, t).nodes : cg.getNodesByName(t);
+        const cands = raw
           .filter((n) => CALLABLE.has(n.kind) && !isTestPath(n.filePath))
           .sort((a, b) => (bodyLines(b) > 1 ? 1 : 0) - (bodyLines(a) > 1 ? 1 : 0) || bodyLines(b) - bodyLines(a));
         // A specific name (<=3 defs) injects all its defs. An overloaded name
@@ -2083,14 +2096,19 @@ export class ToolHandler {
           : flow.pathNodeIds.has(n.id) ? 0
           : flow.uniqueNamedNodeIds.has(n.id) ? 1
           : (fileDefinesSuper && flow.namedNodeIds.has(n.id)) ? 2 : 99;
-        const bodyCap = budget.maxCharsPerFile * 2;
+        // One ~250-line WINDOW per file. syms are taken by priority (spine first,
+        // then uniquely-named, then family-base), and the cap applies to ALL of
+        // them — including the spine — so a big-spine god-file (tokio's worker.rs:
+        // run→run_task→next_task→steal_work) can't eat the whole response and
+        // starve the co-flow file (harness.rs's poll). The native agent windows
+        // such a file too (~190 lines at a time), so this mimics, not truncates.
+        // Always emit ≥1 (never an empty section).
+        const bodyCap = budget.maxCharsPerFile * 1.5;
         const bodyIds = new Set<string>();
         let bodyChars = 0;
         for (const n of syms.filter(n => prio(n) < 99 && n.endLine >= n.startLine).sort((a, b) => prio(a) - prio(b))) {
           const sz = fileLines.slice(n.startLine - 1, n.endLine).join('\n').length;
-          // Spine methods (prio 0) ALWAYS get a full body — the cap governs the
-          // off-path extras (unique-named, family base), never the flow path itself.
-          if (prio(n) > 0 && bodyChars + sz > bodyCap && bodyIds.size > 0) continue;
+          if (bodyChars + sz > bodyCap && bodyIds.size > 0) continue;
           bodyIds.add(n.id);
           bodyChars += sz;
         }
@@ -2155,17 +2173,15 @@ export class ToolHandler {
       // the ceiling and falls through to sectioning/clustering below — full method
       // bodies + signatures — so we never dump (or overflow on) a whole god-file.
       const isCentralFile = centralFiles.has(filePath);
-      // Central files get a larger whole-file ceiling than peripheral ones, but
-      // a BOUNDED one: a flat "whole central file always" dumped a 791-line store
-      // (~28K chars) whole and (a) overflowed the agent's tool cap and (b) starved
-      // the other flow files. Cap lines at 400 and chars at maxCharsPerFile*4 (and
-      // never more than what's left of the total budget) so a genuinely small
-      // heart-file still comes back whole, but a large central file falls through
-      // to per-method sectioning/clustering below — which (now that store actions
-      // are extracted as nodes) surfaces the NAMED methods in full instead.
-      const WHOLE_FILE_MAX_LINES = isCentralFile ? 400 : 220;
+      // Central files get a slightly larger whole-file window than peripheral ones,
+      // but a TIGHT one (~1.5× the per-file cap): the native read of a central file
+      // is a ~150–250 line orientation window, NOT the whole file. A flat "whole
+      // central file" both overflowed the inline cap AND starved the co-flow files
+      // (worker.rs ate the budget, dropping harness.rs's poll). A larger central
+      // file falls through to per-method windowing/clustering below.
+      const WHOLE_FILE_MAX_LINES = isCentralFile ? 280 : 220;
       const WHOLE_FILE_MAX_CHARS = isCentralFile
-        ? Math.min(Math.max(0, budget.maxOutputChars - totalChars - 200), budget.maxCharsPerFile * 4)
+        ? Math.min(Math.max(0, budget.maxOutputChars - totalChars - 200), Math.round(budget.maxCharsPerFile * 1.5))
         : budget.maxCharsPerFile * 3;
       if (fileLines.length <= WHOLE_FILE_MAX_LINES && fileContent.length <= WHOLE_FILE_MAX_CHARS) {
         const body = fileContent.replace(/\n+$/, '');
@@ -2472,22 +2488,16 @@ export class ToolHandler {
       }
     }
 
-    // Hard-cap to the adaptive budget. The per-file loop bounds the source
-    // sections, but the relationship map, additional-files list, and
-    // completeness/budget notes can still push the assembled output past
-    // maxOutputChars (observed 30k against a 28k tier cap). A fat explore
-    // payload persists in the agent's context and is re-read as cache-input
-    // on every subsequent turn, so the overrun is paid many times over.
-    // Final ceiling. The render loop is now the authority on WHAT to emit — it
-    // renders necessary files (named/spine) even past maxOutputChars and caps
-    // only incidental ones, all bounded by maxFiles + per-file true-spine — so
-    // this is a SAFETY ceiling above that necessary content, not a hard cut
-    // through it. Cutting at a flat maxOutputChars here undid the whole point:
-    // Alamofire's loop assembles build+validators-exec+validate (~15K) and a 13K
-    // slice dropped the validate phase the agent then Read. Allow necessary
-    // overflow up to 1.5× (still bounds a pathological monolith).
+    // Final ceiling — an ABSOLUTE inline cap, not a multiple of the budget. The
+    // render loop renders necessary (named/spine) files even a bit past
+    // maxOutputChars and caps only incidental ones, so this is the last safety.
+    // It MUST stay under the host's inline tool-result limit (~25K chars): above
+    // that the result is externalized to a file the agent Reads back (a 35K
+    // vscode explore did exactly this in the n=4 A/B). So allow a little
+    // necessary overflow above the 24K budget, but hard-stop at 25K — never into
+    // externalize territory.
     const output = flow.text + lines.join('\n');
-    const hardCeiling = Math.round(budget.maxOutputChars * 1.5);
+    const hardCeiling = Math.min(Math.round(budget.maxOutputChars * 1.5), 25000);
     if (output.length > hardCeiling) {
       // Cut at a FILE-SECTION boundary (the last `#### ` header before the
       // ceiling) so we drop whole trailing file-sections rather than slicing
