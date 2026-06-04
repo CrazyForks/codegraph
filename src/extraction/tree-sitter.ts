@@ -1779,6 +1779,13 @@ export class TreeSitterExtractor {
           const parentId = this.nodeStack[this.nodeStack.length - 1];
           if (parentId) this.emitPhpUseRefs(node, parentId);
         }
+        // Ruby `require "lib/foo"` / `require_relative "../foo"` — resolve to the
+        // required FILE so a file pulled in only by `require` (config-loaded
+        // components, gems that don't autoload) records a cross-file dependency.
+        if (this.language === 'ruby' && node.type === 'call') {
+          const parentId = this.nodeStack[this.nodeStack.length - 1];
+          if (parentId) this.emitRubyRequireRefs(node, parentId);
+        }
         return;
       }
       // Hook returned null — fall through to multi-import inline handlers only
@@ -2046,6 +2053,45 @@ export class TreeSitterExtractor {
     const qn = clause.namedChildren.find((c: SyntaxNode) => c.type === 'qualified_name')
       ?? clause.namedChildren.find((c: SyntaxNode) => c.type === 'name');
     if (qn) this.pushPhpUseRef(getNodeText(qn, this.source), fromNodeId, node);
+  }
+
+  /**
+   * Ruby `require`/`require_relative` → an `imports` ref to the required FILE.
+   * `require "sidekiq/fetch"` is load-path-relative (matched by file-path suffix
+   * via {@link matchByFilePath}); `require_relative "../foo"` is resolved against
+   * this file's directory. Bare gem/stdlib requires (`require "json"`, no slash)
+   * are skipped — they're external. The path form (a `/` + `.rb`) makes the ref
+   * resolve to the file node, so a file pulled in only by `require` — not by a
+   * resolved constant/call — still records a cross-file dependency.
+   */
+  private emitRubyRequireRefs(node: SyntaxNode, fromNodeId: string): void {
+    const method = node.namedChildren.find((c: SyntaxNode) => c.type === 'identifier');
+    const mname = method ? getNodeText(method, this.source) : '';
+    if (mname !== 'require' && mname !== 'require_relative') return;
+    const argList = node.namedChildren.find((c: SyntaxNode) => c.type === 'argument_list');
+    const str = argList?.namedChildren.find((c: SyntaxNode) => c.type === 'string');
+    const content = str?.namedChildren.find((c: SyntaxNode) => c.type === 'string_content');
+    if (!content) return;
+    const req = getNodeText(content, this.source).trim();
+    if (!req) return;
+
+    let refPath: string;
+    if (mname === 'require_relative') {
+      const slash = this.filePath.lastIndexOf('/');
+      const dir = slash >= 0 ? this.filePath.slice(0, slash) : '';
+      refPath = path.posix.normalize(dir ? `${dir}/${req}` : req);
+    } else {
+      refPath = req; // load-path require — suffix-matched against the file path
+    }
+    if (!refPath.includes('/')) return; // bare gem/stdlib require — external
+    if (!refPath.endsWith('.rb')) refPath += '.rb';
+    this.unresolvedReferences.push({
+      fromNodeId,
+      referenceName: refPath,
+      referenceKind: 'imports',
+      line: node.startPosition.row + 1,
+      column: node.startPosition.column,
+    });
   }
 
   /** Convert a PHP FQN `Foo\Bar\Baz` to the stored `Foo\Bar::Baz` and emit an `imports` ref. */
