@@ -3895,6 +3895,35 @@ describe('Python absolute module import resolution', () => {
     const osNode = cg.getNodesByKind('file').find((n) => n.filePath.endsWith('/os.py'));
     expect(osNode, 'no stdlib os.py node').toBeUndefined();
   });
+
+  it('resolves `from pkg import submodule` to the submodule under that package, not a same-named one', async () => {
+    // FastAPI router-aggregator pattern: `from app.api.routes import authentication`
+    // with same-named modules in sibling packages must resolve via the import's
+    // SOURCE (the package), not a coincidental same-basename file elsewhere.
+    fs.mkdirSync(path.join(tempDir, 'app/api/routes'), { recursive: true });
+    fs.mkdirSync(path.join(tempDir, 'app/api/dependencies'), { recursive: true });
+    for (const p of ['app/__init__.py', 'app/api/__init__.py', 'app/api/routes/__init__.py', 'app/api/dependencies/__init__.py']) {
+      fs.writeFileSync(path.join(tempDir, p), '');
+    }
+    fs.writeFileSync(path.join(tempDir, 'app/api/routes/authentication.py'), `def login():\n    pass\n`);
+    fs.writeFileSync(path.join(tempDir, 'app/api/dependencies/authentication.py'), `def get_user():\n    pass\n`);
+    fs.writeFileSync(
+      path.join(tempDir, 'app/api/routes/api.py'),
+      `from app.api.routes import authentication\n\nROUTER = authentication\n`
+    );
+
+    cg = CodeGraph.initSync(tempDir);
+    await cg.indexAll();
+    cg.resolveReferences();
+
+    const routesAuth = cg.getNodesByKind('file').find((n) => n.filePath.endsWith('routes/authentication.py'));
+    const depsAuth = cg.getNodesByKind('file').find((n) => n.filePath.endsWith('dependencies/authentication.py'));
+    expect(routesAuth && depsAuth).toBeTruthy();
+    const routesDeps = [...cg.getImpactRadius(routesAuth!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    const depsDeps = [...cg.getImpactRadius(depsAuth!.id, 2).nodes.values()].map((n) => n.filePath ?? '');
+    expect(routesDeps.some((p) => p.endsWith('routes/api.py')), 'submodule under the imported package is the dependent').toBe(true);
+    expect(depsDeps.some((p) => p.endsWith('routes/api.py')), 'same-named module in a sibling package is NOT').toBe(false);
+  });
 });
 
 describe('Same-directory include + KMP import resolution', () => {

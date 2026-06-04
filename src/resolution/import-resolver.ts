@@ -1331,48 +1331,71 @@ function resolveModuleImportToFile(
     }
 
     const resolvedPath = resolveImportPath(modulePath, ref.filePath, ref.language, context);
-    if (!resolvedPath || resolvedPath === ref.filePath) continue;
+    if (resolvedPath && resolvedPath !== ref.filePath) {
+      const fileNode = context.getNodesInFile(resolvedPath).find((n) => n.kind === 'file');
+      if (fileNode) {
+        return { original: ref, targetNodeId: fileNode.id, confidence: 0.9, resolvedBy: 'import' };
+      }
+    }
 
-    const fileNode = context.getNodesInFile(resolvedPath).find((n) => n.kind === 'file');
-    if (fileNode) {
-      return { original: ref, targetNodeId: fileNode.id, confidence: 0.9, resolvedBy: 'import' };
+    // Python absolute `from a.b import submodule` (a FastAPI router aggregator's
+    // `from app.api.routes import authentication`): resolveImportPath only maps
+    // RELATIVE dotted paths to a file, so resolve the absolute dotted module
+    // directly to its file node.
+    if (ref.language === 'python') {
+      const modFile = findPythonModuleFile(modulePath, context, ref.filePath);
+      if (modFile) {
+        return { original: ref, targetNodeId: modFile.id, confidence: 0.9, resolvedBy: 'import' };
+      }
     }
   }
   return null;
 }
 
 /**
- * Resolve a Python ABSOLUTE dotted module import (`import a.b.c`) to its file.
- * `a.b.c` → a file node ending in `a/b/c.py` (a module) or `a/b/c/__init__.py`
- * (a package). The suffix match tolerates a package rooted under `src/` etc.
- * Stdlib/external modules return null (no matching file node in the repo), so
- * `import os` creates no edge. Covers the Django `AppConfig.ready(): import
- * myapp.signals` pattern and any side-effect module import.
+ * Find the file node for a Python dotted module path `a.b.c` — a module file
+ * ending in `a/b/c.py`, or a package `a/b/c/__init__.py` (suffix-matched, so a
+ * package rooted under `src/` etc. still resolves). Returns null for
+ * stdlib/external modules (no matching repo file node), so `import os` creates
+ * no edge. Shared by absolute `import a.b.c` and absolute `from a.b import c`
+ * (where `c` is a submodule) resolution.
+ */
+function findPythonModuleFile(
+  mod: string,
+  context: ResolutionContext,
+  excludeFilePath: string
+): Node | null {
+  if (!mod || mod.startsWith('.')) return null; // relative imports handled elsewhere
+  const rel = mod.replace(/\./g, '/');
+  const lastSeg = mod.split('.').pop()!;
+  const endsWith = (p: string, want: string): boolean => p === want || p.endsWith('/' + want);
+  const moduleFile = context
+    .getNodesByName(`${lastSeg}.py`)
+    .find((n) => n.kind === 'file' && n.filePath !== excludeFilePath && endsWith(n.filePath, `${rel}.py`));
+  if (moduleFile) return moduleFile;
+  const pkgFile = context
+    .getNodesByName('__init__.py')
+    .find((n) => n.kind === 'file' && n.filePath !== excludeFilePath && endsWith(n.filePath, `${rel}/__init__.py`));
+  return pkgFile ?? null;
+}
+
+/**
+ * Resolve a Python ABSOLUTE dotted module import (`import a.b.c`) to its file —
+ * the Django `AppConfig.ready(): import myapp.signals` pattern and any
+ * side-effect module import.
  */
 function resolvePythonAbsoluteModule(
   ref: UnresolvedRef,
   context: ResolutionContext
 ): ResolvedRef | null {
   if (ref.referenceKind !== 'imports') return null;
-  const mod = ref.referenceName;
-  if (!mod || mod.startsWith('.')) return null; // relative imports handled elsewhere
-  const rel = mod.replace(/\./g, '/');
-  const lastSeg = mod.split('.').pop()!;
-  const wantModule = `${rel}.py`;
-  const wantPkg = `${rel}/__init__.py`;
-  const endsWith = (p: string, want: string): boolean => p === want || p.endsWith('/' + want);
-
-  const moduleFiles = context.getNodesByName(`${lastSeg}.py`).filter((n) => n.kind === 'file');
-  const hitModule = moduleFiles.find((n) => endsWith(n.filePath, wantModule));
-  if (hitModule && hitModule.filePath !== ref.filePath) {
-    return { original: ref, targetNodeId: hitModule.id, confidence: 0.9, resolvedBy: 'import' };
-  }
-  const pkgFiles = context.getNodesByName('__init__.py').filter((n) => n.kind === 'file');
-  const hitPkg = pkgFiles.find((n) => endsWith(n.filePath, wantPkg));
-  if (hitPkg && hitPkg.filePath !== ref.filePath) {
-    return { original: ref, targetNodeId: hitPkg.id, confidence: 0.9, resolvedBy: 'import' };
-  }
-  return null;
+  // Only a DOTTED `import a.b.c` ref carries its full module path. A bare leaf
+  // (`from app.api.routes import authentication`) is ambiguous on its own — three
+  // `authentication.py` files may exist — so leave it to resolveModuleImportToFile,
+  // which uses the import's source (`app.api.routes`) to build the full path.
+  if (!ref.referenceName.includes('.')) return null;
+  const hit = findPythonModuleFile(ref.referenceName, context, ref.filePath);
+  return hit ? { original: ref, targetNodeId: hit.id, confidence: 0.9, resolvedBy: 'import' } : null;
 }
 
 /**
