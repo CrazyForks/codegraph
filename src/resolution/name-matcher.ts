@@ -44,12 +44,20 @@ export function matchByFilePath(
     };
   }
 
-  // Fall back to suffix match (e.g., ref="snippets/foo.liquid" matches "src/snippets/foo.liquid")
-  const suffixMatch = fileNodes.find(n => n.qualifiedName.endsWith(ref.referenceName) || n.filePath.endsWith(ref.referenceName));
-  if (suffixMatch) {
+  // Fall back to suffix match (e.g., ref="snippets/foo.liquid" matches
+  // "src/snippets/foo.liquid"). When several files share the basename — a
+  // `#include "RNCAsyncStorage.h"` with a same-named header on another platform
+  // (windows/code/ vs apple/) — prefer the one in the includer's own directory,
+  // then by directory proximity / same language family. A C/C++ include (and any
+  // bare-filename import) resolves relative to the including file, not to an
+  // arbitrary same-named header elsewhere in the tree.
+  const suffixMatches = fileNodes.filter(
+    n => n.qualifiedName.endsWith(ref.referenceName) || n.filePath.endsWith(ref.referenceName)
+  );
+  if (suffixMatches.length > 0) {
     return {
       original: ref,
-      targetNodeId: suffixMatch.id,
+      targetNodeId: pickClosestFileNode(suffixMatches, ref).id,
       confidence: 0.85,
       resolvedBy: 'file-path',
     };
@@ -66,6 +74,35 @@ export function matchByFilePath(
   }
 
   return null;
+}
+
+/**
+ * Among several file nodes that all match a bare include/import by basename,
+ * pick the one closest to the referencing file: same directory first, then by
+ * directory-tree proximity, with the same language family as a tiebreak. A
+ * C/C++ `#include "X.h"` (and any bare-filename import) resolves relative to the
+ * including file — not to an arbitrary same-named header on another platform.
+ */
+function pickClosestFileNode(candidates: Node[], ref: UnresolvedRef): Node {
+  const dirOf = (p: string): string => {
+    const i = p.lastIndexOf('/');
+    return i >= 0 ? p.slice(0, i) : '';
+  };
+  const refDir = dirOf(ref.filePath);
+  const sameDir = candidates.filter((c) => dirOf(c.filePath) === refDir);
+  const pool = sameDir.length > 0 ? sameDir : candidates;
+  let best = pool[0]!;
+  let bestScore = -Infinity;
+  for (const c of pool) {
+    const score =
+      computePathProximity(ref.filePath, c.filePath) +
+      (sameLanguageFamily(c.language, ref.language) ? 5 : 0);
+    if (score > bestScore) {
+      bestScore = score;
+      best = c;
+    }
+  }
+  return best;
 }
 
 /**

@@ -1030,12 +1030,51 @@ export function resolveJvmImport(
   const candidates = context.getNodesByQualifiedName(`${pkg}::${sym}`);
   if (candidates.length === 0) return null;
 
+  // Kotlin Multiplatform: an `expect` declaration and its `actual`s share one
+  // FQN across source sets (commonMain / androidMain / appleMain). Taking the
+  // first candidate let a single platform `actual` absorb every common-side
+  // import, so the `expect` (the canonical API a commonMain file imports)
+  // looked unused. Prefer the candidate CLOSEST to the importing file by
+  // directory proximity — a commonMain import resolves to the commonMain
+  // declaration — with the `expect` side as a tiebreak.
+  const best = candidates.length === 1 ? candidates[0]! : pickClosestJvmCandidate(candidates, ref.filePath);
   return {
     original: ref,
-    targetNodeId: candidates[0]!.id,
+    targetNodeId: best.id,
     confidence: 0.95,
     resolvedBy: 'import',
   };
+}
+
+/**
+ * Pick the same-FQN candidate closest to `fromPath` by shared directory
+ * prefix, preferring an `expect` declaration on a tie. Used to keep a Kotlin
+ * Multiplatform `expect`/`actual` import resolving within the importer's own
+ * source set instead of an arbitrary platform `actual`.
+ */
+function pickClosestJvmCandidate(candidates: Node[], fromPath: string): Node {
+  const fromDirs = fromPath.split('/').slice(0, -1);
+  const sharedPrefix = (p: string): number => {
+    const d = p.split('/').slice(0, -1);
+    let shared = 0;
+    for (let i = 0; i < Math.min(fromDirs.length, d.length); i++) {
+      if (fromDirs[i] === d[i]) shared++;
+      else break;
+    }
+    return shared;
+  };
+  const isExpect = (n: Node): boolean => Array.isArray(n.decorators) && n.decorators.includes('expect');
+  let best = candidates[0]!;
+  let bestProx = sharedPrefix(best.filePath);
+  for (let i = 1; i < candidates.length; i++) {
+    const c = candidates[i]!;
+    const prox = sharedPrefix(c.filePath);
+    if (prox > bestProx || (prox === bestProx && isExpect(c) && !isExpect(best))) {
+      best = c;
+      bestProx = prox;
+    }
+  }
+  return best;
 }
 
 export function resolveViaImport(
@@ -1050,6 +1089,23 @@ export function resolveViaImport(
   // edge — resolveViaImport's symbol lookup below would search the
   // resolved file for a symbol named like the file extension and fail.
   if ((ref.language === 'c' || ref.language === 'cpp') && ref.referenceKind === 'imports') {
+    // C/C++ quoted includes (`#include "X.h"`) resolve relative to the
+    // INCLUDING file's own directory first (the C standard's quoted-include
+    // search order). Prefer a same-directory header over an -I directory or a
+    // same-named header on another platform (windows/code/RNCAsyncStorage.h vs
+    // apple/.../RNCAsyncStorage.h) — the include-dir heuristic below would
+    // otherwise pick an arbitrary same-named header, leaving the real local one
+    // with no dependents.
+    const slash = ref.filePath.lastIndexOf('/');
+    const fromDir = slash >= 0 ? ref.filePath.slice(0, slash) : '';
+    const siblingPath = path.posix.normalize(fromDir ? `${fromDir}/${ref.referenceName}` : ref.referenceName);
+    const siblingBase = siblingPath.split('/').pop()!;
+    const sibling = context
+      .getNodesByName(siblingBase)
+      .find((n) => n.kind === 'file' && n.filePath === siblingPath);
+    if (sibling) {
+      return { original: ref, targetNodeId: sibling.id, confidence: 0.92, resolvedBy: 'import' };
+    }
     const resolvedPath = resolveImportPath(ref.referenceName, ref.filePath, ref.language, context);
     if (!resolvedPath) return null;
     const basename = resolvedPath.split('/').pop()!;
