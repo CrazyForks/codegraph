@@ -182,8 +182,12 @@ const MEMBER_ACCESS_TYPES: ReadonlySet<string> = new Set([
  * member-access receiver is reliably a type (not a local/variable). The
  * static-member/value-read pass is gated to these — the ones where it was the
  * confirmed residual frontier (enum-value / static-field reads). TS/JS/Python
- * are deliberately excluded: their coverage was already high and they drive the
- * retrieval-performance benchmark, so there's no need to perturb their graph.
+ * are deliberately excluded, and a measured A/B confirms the call: extending the
+ * pass to them adds ZERO coverage — in import-based languages you must `import` a
+ * type before any `Type.MEMBER` read, so the import edge already covers it (the
+ * static read is pure duplication) — while adding real graph noise (+1813 edges /
+ * +2448 `references` on excalidraw, the retrieval-perf benchmark, all pointing at
+ * already-covered types). Don't re-add `member_expression`/`attribute` here.
  */
 const STATIC_MEMBER_LANGS: ReadonlySet<string> = new Set([
   'java', 'csharp', 'kotlin', 'swift', 'scala', 'dart', 'php', 'cpp',
